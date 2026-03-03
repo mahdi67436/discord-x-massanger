@@ -1,0 +1,226 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ============== HELPER FUNCTIONS ==============
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Check if user owns the resource
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Check if user is in allowed list
+    function isMember(allowedUsers) {
+      return isAuthenticated() && request.auth.uid in allowedUsers;
+    }
+    
+    // Check if user is admin
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.admin == true;
+    }
+    
+    // Check if user is server admin
+    function isServerAdmin(serverId) {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/servers/$(serverId)/roles/$(request.auth.uid));
+    }
+    
+    // Check if user is org admin
+    function isOrgAdmin(orgId) {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/organizations/$(orgId)/admins/$(request.auth.uid));
+    }
+    
+    // Validate email
+    function isValidEmail(email) {
+      return email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+    
+    // Check rate limit
+    function isRateLimited() {
+      return false; // Implement with Cloud Functions
+    }
+
+    // ============== USERS COLLECTION ==============
+    
+    match /users/{userId} {
+      // Read user profile
+      allow read: if isAuthenticated();
+      
+      // Create user profile
+      allow create: if isOwner(userId)
+        && request.resource.data.username is string
+        && request.resource.data.username.size() >= 3
+        && request.resource.data.username.size() <= 32
+        && request.resource.data.displayName is string;
+      
+      // Update own profile
+      allow update: if isOwner(userId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['email', 'password', 'createdAt']) == false;
+      
+      // Delete account
+      allow delete: if isOwner(userId);
+      
+      // Subcollections
+      match /tokens/{tokenId} {
+        allow read, write: if isOwner(userId);
+      }
+      
+      match /settings/{settingId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+    
+    // ============== CONVERSATIONS COLLECTION ==============
+    
+    match /conversations/{conversationId} {
+      allow read: if isAuthenticated() 
+        && resource.data.participantIds[request.auth.uid] != null;
+      
+      allow create: if isAuthenticated()
+        && request.resource.data.participantIds[request.auth.uid] != null;
+      
+      allow update: if isAuthenticated()
+        && (resource.data.participantIds[request.auth.uid] != null
+            || isAdmin());
+      
+      allow delete: if isAuthenticated()
+        && (resource.data.ownerId == request.auth.uid || isAdmin());
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow read: if isAuthenticated();
+        allow create: if isAuthenticated()
+          && isRateLimited() == false;
+        allow update: if isAuthenticated()
+          && resource.data.senderId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasAny(['content', 'attachments', 'embeds']);
+        allow delete: if isAuthenticated()
+          && (resource.data.senderId == request.auth.uid
+              || isAdmin());
+      }
+    }
+    
+    // ============== SERVERS COLLECTION ==============
+    
+    match /servers/{serverId} {
+      allow read: if isAuthenticated();
+      
+      allow create: if isAuthenticated();
+      
+      allow update: if isAuthenticated()
+        && (resource.data.ownerId == request.auth.uid
+            || isServerAdmin(serverId));
+      
+      allow delete: if isAuthenticated()
+        && resource.data.ownerId == request.auth.uid;
+      
+      // Channels
+      match /channels/{channelId} {
+        allow read: if isAuthenticated();
+        allow create, update: if isAuthenticated()
+          && isServerAdmin(serverId);
+        allow delete: if isAuthenticated()
+          && isServerAdmin(serverId);
+          
+        match /messages/{messageId} {
+          allow read, create: if isAuthenticated();
+          allow update, delete: if isAuthenticated()
+            && (resource.data.senderId == request.auth.uid
+                || isServerAdmin(serverId));
+        }
+      }
+      
+      // Roles
+      match /roles/{roleId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated()
+          && isServerAdmin(serverId);
+      }
+      
+      // Members
+      match /members/{memberId} {
+        allow read: if isAuthenticated();
+        allow write: if isAuthenticated()
+          && isServerAdmin(serverId);
+      }
+    }
+    
+    // ============== ORGANIZATIONS COLLECTION ==============
+    
+    match /organizations/{orgId} {
+      allow read: if isAuthenticated();
+      
+      allow create: if isAuthenticated();
+      
+      allow update: if isAuthenticated()
+        && (resource.data.ownerId == request.auth.uid
+            || isOrgAdmin(orgId));
+      
+      allow delete: if isAuthenticated()
+        && resource.data.ownerId == request.auth.uid;
+      
+      // Departments
+      match /departments/{deptId} {
+        allow read: if isAuthenticated()
+          && orgId in request.auth.token.organizations;
+        allow write: if isAuthenticated()
+          && isOrgAdmin(orgId);
+      }
+      
+      // Projects
+      match /projects/{projectId} {
+        allow read: if isAuthenticated()
+          && orgId in request.auth.token.organizations;
+        allow write: if isAuthenticated()
+          && isOrgAdmin(orgId);
+          
+        match /tasks/{taskId} {
+          allow read, write: if isAuthenticated();
+        }
+      }
+      
+      // Billing
+      match /billing/{billingId} {
+        allow read, write: if isAuthenticated()
+          && isOrgAdmin(orgId);
+      }
+    }
+    
+    // ============== AI MODERATION ==============
+    
+    match /moderation/{modId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+    
+    // ============== REPORTS ==============
+    
+    match /reports/{reportId} {
+      allow create: if isAuthenticated();
+      allow read, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+    
+    // ============== AUDIT LOGS ==============
+    
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+    }
+    
+    // ============== ANALYTICS ==============
+    
+    match /analytics/{analyticsId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+    }
+  }
+}
